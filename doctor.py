@@ -124,7 +124,7 @@ class Check:
 
 def _sh(cmd, timeout=6):
     try:
-        r = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip(), r.returncode
     except Exception:
         return "", 1
@@ -903,9 +903,9 @@ def diagnose_build_sh(pkg_name: str) -> list:
 
 def run_fix(check: Check, mode_fix: bool):
     if not mode_fix or check.status not in (FAIL, WARN):
-        return
+        return False
     if not (check.fix_cmd or check.fix_fn or check.fix_hint):
-        return
+        return False
 
     blank()
     print(f"  {BCYN}{B}FIX{R}  {B}{check.name}{R}")
@@ -917,7 +917,8 @@ def run_fix(check: Check, mode_fix: bool):
             print(f"  {BGRN if ok else BYLW}{B}{'OK  Fix applied' if ok else '!!  Fix ran — review result'}{R}")
         except Exception as e:
             print(f"  {BRED}{B}XX{R}  Fix function failed: {e}")
-        return
+            return False
+        return bool(ok)
 
     if check.fix_cmd:
         print(f"  {DIM}Running:{R}  {BCYN}{check.fix_cmd}{R}")
@@ -928,17 +929,19 @@ def run_fix(check: Check, mode_fix: bool):
         rule("─", DIM)
         if rc == 0:
             print(f"  {BGRN}{B}OK{R}  Fix applied")
+            return True
         else:
             print(f"  {BRED}{B}XX{R}  Fix failed (exit {rc})")
             if check.fix_hint:
                 print(f"  {DIM}Try manually:{R}  {BCYN}{check.fix_hint}{R}")
-        return
+        return False
 
     print(f"  {BYLW}{B}!!{R}  No automatic fix — manual steps:")
     blank()
     for ln in textwrap.wrap(check.fix_hint, W()-8):
         code(ln)
     rule("─", DIM)
+    return False
 
 
 SECTIONS = [
@@ -1155,9 +1158,12 @@ def main():
         blank()
         for fn in fns:
             c = fn()
-            all_checks.append(c)
             c.print_line()
-            run_fix(c, mode_fix)
+            if run_fix(c, mode_fix):
+                c = fn()  # re-check so summary/exit code reflect the fix
+                print(f"  {DIM}↳ re-checked:{R}")
+                c.print_line()
+            all_checks.append(c)
         blank()
 
     print_summary(all_checks, mode_fix=mode_fix)

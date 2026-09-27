@@ -8,6 +8,8 @@ and this project adheres to semantic versioning.
 ## [Unreleased]
 
 ### Fixed
+- `doctor.py` - `_sh()` ran every check command with `subprocess.run(cmd, shell=False)` while every caller passed a shell-syntax string (pipes, `2>/dev/null`, `||`); with `shell=False` the whole string was treated as a single executable name, so it always failed silently and returned `("", 1)` — this caused false failures across almost the entire report (`pip` reported "not found", `TAS importable` failed, and `build.sh scan` reported all 93 packages as `syntax` errors even though `bash -n` was never actually able to run). Changed to `shell=True` so these checks now reflect the real environment state
+- `doctor.py` - `run_fix()` executed a check's fix (`fix_cmd`/`fix_fn`) but never re-ran the originating check afterward, so `--fix` could report "OK Fix applied" for an item while the summary counts, exit code, and printed status still showed the pre-fix `WARN`/`FAIL`. `run_fix()` now returns whether the fix succeeded, and `main()` re-runs the check function and updates the result whenever a fix was applied
 - `.github/workflows/build-packages-debs.yml` - `github.event.inputs.package`/`.force` were interpolated directly into a `run:` shell block via `${{ }}` (GitHub Actions script-injection pattern, CWE-94); moved to `env:` and referenced as shell variables instead; added a package-name character check before the value is used in `rm -f`
 - `.github/workflows/repin-floating-sources.yml` - `github.event.inputs.packages` had the same direct-interpolation issue; moved to `env:`, added a character allowlist check before the value is word-split and passed to `ci/repin_floating_sources.py`
 
