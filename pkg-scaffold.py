@@ -559,23 +559,94 @@ _METHOD_SIGNALS = [
     ("*.gemspec",       "ruby"),
 ]
 
-def detect_method_from_github(repo_url, default_branch="main"):
-    m = re.match(r"https://github\.com/([^/]+)/([^/\s]+?)(?:\.git)?$", repo_url)
-    if not m:
-        return None, None
-    owner, repo = m.group(1), m.group(2)
+_SCRIPT_EXT = {
+    ".py":  "python-script",
+    ".sh":  "shell",
+    ".bash": "shell",
+    ".pl":  "perl",
+    ".lua": "lua",
+    ".php": "php",
+}
 
-    tree_body = _http_get(
-        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}",
-    )
-    if not tree_body:
-        return None, None
+_SHEBANG_METHOD = [
+    ("python", "python-script"),
+    ("bash",   "shell"),
+    ("/sh",    "shell"),
+    ("env sh", "shell"),
+    ("perl",   "perl"),
+    ("lua",    "lua"),
+    ("php",    "php"),
+]
+
+def _repo_parts(repo_url):
+    m = re.match(r"https://github\.com/([^/]+)/([^/\s]+?)(?:\.git)?/?$", repo_url)
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+def fetch_repo_tree(repo_url, default_branch="main"):
+    owner, repo = _repo_parts(repo_url)
+    if not owner:
+        return None
+    body = _http_get(
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}")
+    if not body:
+        return None
     try:
-        tree = json.loads(tree_body)
+        tree = json.loads(body).get("tree", [])
     except Exception:
+        return None
+    return [{"path": t["path"], "size": t.get("size", 0)}
+            for t in tree if t.get("type") == "blob"]
+
+def _sniff_shebang(repo_url, branch, path):
+    owner, repo = _repo_parts(repo_url)
+    body = _http_get(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}")
+    if not body:
+        return None
+    first = body.split("\n", 1)[0]
+    if not first.startswith("#!"):
+        return None
+    for needle, method in _SHEBANG_METHOD:
+        if needle in first:
+            return method
+    return None
+
+def detect_entrypoints(repo_url, branch, files):
+    found = []
+    for f in files:
+        name = f["path"]
+        ext = os.path.splitext(name)[1].lower()
+        if ext in _SCRIPT_EXT:
+            found.append((name, _SCRIPT_EXT[ext]))
+        elif ext == "" and name.isascii() and 0 < f["size"] < 500_000 \
+                and not name.upper().startswith(("LICENSE", "README", "MAKEFILE",
+                                                 "DOCKERFILE", "CHANGELOG",
+                                                 "AUTHORS", "CODEOWNERS")):
+            m = _sniff_shebang(repo_url, branch, name)
+            if m:
+                found.append((name, m))
+    return found
+
+def rank_entrypoints(found, pkg):
+    preferred = [f"{pkg}", f"{pkg}.py", f"{pkg}.sh", "main.py", "main.sh",
+                 "run", "run.sh", "start", "start.sh", "app.py", "cli.py"]
+    def score(item):
+        n = item[0]
+        for i, p in enumerate(preferred):
+            if n == p:
+                return i
+        if n.lower() in ("setup.py", "install", "install.sh", "uninstall.sh",
+                         "conftest.py"):
+            return 900
+        return 100
+    return sorted(found, key=score)
+
+def detect_method_from_github(repo_url, default_branch="main", files=None):
+    if files is None:
+        files = fetch_repo_tree(repo_url, default_branch)
+    if files is None:
         return None, None
 
-    filenames = {item["path"] for item in tree.get("tree", [])}
+    filenames = {f["path"] for f in files}
 
     for sig, method in _METHOD_SIGNALS:
         if sig.startswith("*"):
@@ -766,30 +837,51 @@ def main():
 
     _detected_method = None
     _detected_signal = None
-    _default_branch  = None
+    _default_branch  = "main"
+    _repo_files      = None
+    _candidates      = []
     if github_url and meta:
-        _default_branch = "main"
-        _raw = _http_get(
-            f"https://api.github.com/repos/{'/'.join(re.search(r'github.com/(.+)', github_url).group(1).rstrip('/').split('/')[:2])}"
-        )
-        if _raw:
-            try:
-                _default_branch = json.loads(_raw).get("default_branch", "main")
-            except Exception:
-                pass
+        _owner, _repo = _repo_parts(github_url)
+        if _owner:
+            _raw = _http_get(f"https://api.github.com/repos/{_owner}/{_repo}")
+            if _raw:
+                try:
+                    _default_branch = json.loads(_raw).get("default_branch", "main")
+                except Exception:
+                    pass
 
-        log("Auto-detecting build method from repo file tree...")
-        _detected_method, _detected_signal = detect_method_from_github(github_url, _default_branch)
-        if _detected_method:
-            ok(f"Detected: {BCYN}{_detected_method}{R}  {DIM}(found {_detected_signal}){R}")
+            log("Scanning repo files to detect how to build it...")
+            _repo_files = fetch_repo_tree(github_url, _default_branch)
+            if _repo_files is not None:
+                _detected_method, _detected_signal = detect_method_from_github(
+                    github_url, _default_branch, files=_repo_files)
+                if _detected_method:
+                    ok(f"Detected: {BCYN}{_detected_method}{R}  {DIM}(found {_detected_signal}){R}")
+                else:
+                    _candidates = rank_entrypoints(
+                        detect_entrypoints(github_url, _default_branch, _repo_files),
+                        pkg_name)
+                    if _candidates:
+                        _detected_method = _candidates[0][1]
+                        ok(f"Detected: {BCYN}{_detected_method}{R}  "
+                           f"{DIM}(found script {_candidates[0][0]}){R}")
+                    else:
+                        warn("No build files or runnable script found in the repo root.")
+                        info("Files in repo root: " +
+                             ", ".join(f["path"] for f in _repo_files[:12]))
+                        info("Choose 'Other / manual' and edit build.sh afterwards.")
+            else:
+                warn("Could not read the repo file list — pick the method manually.")
             blank()
 
-    _default_idx = 0
+    _default_idx = len(BUILD_METHODS) - 1
     if _detected_method:
         for i, (k, _) in enumerate(BUILD_METHODS):
             if k == _detected_method:
                 _default_idx = i
                 break
+    elif not github_url or not meta:
+        _default_idx = 0
 
     method = ask_choice(
         "How should this package be built / installed?",
@@ -810,15 +902,48 @@ def main():
             "lua":           f"{pkg_name}.lua",
             "php":           f"{pkg_name}.php",
         }
-        entrypoint = ask(
-            "Main entrypoint file",
-            default=ext_map.get(method, f"{pkg_name}"),
-            hint="filename relative to source root that starts the program",
-        )
+
+        if _repo_files is not None and not _candidates:
+            _candidates = rank_entrypoints(
+                detect_entrypoints(github_url, _default_branch, _repo_files),
+                pkg_name)
+        _same = [c for c in _candidates if c[1] == method] or _candidates
+
+        _default_entry = ext_map.get(method, f"{pkg_name}")
+        if _same:
+            print(f"  {DIM}Runnable files found in the repo root:{R}")
+            for n, m in _same[:8]:
+                print(f"      {BCYN}{n}{R}  {DIM}({m}){R}")
+            blank()
+            _default_entry = _same[0][0]
+
+        _root_names = {f["path"] for f in _repo_files} if _repo_files else None
+        while True:
+            entrypoint = ask(
+                "Main entrypoint file",
+                default=_default_entry,
+                hint="filename relative to source root that starts the program",
+            )
+            if _root_names is None or entrypoint in _root_names:
+                break
+            warn(f"'{entrypoint}' does NOT exist in the repo root — "
+                 "the build would fail.")
+            if not ask_yn("Use it anyway? (e.g. file is in a subfolder)",
+                          default_yes=False):
+                blank()
+                continue
+            break
     else:
         entrypoint = f"{pkg_name}"
         if method in ("cargo", "go", "npm", "cmake", "make", "pip"):
             print(f"  {DIM}  Step 5 skipped — entrypoint not needed for {BCYN}{method}{DIM} builds.{R}")
+            blank()
+        elif method == "unknown":
+            callout("NOTE",
+                    "build.sh will contain a placeholder install step. Open "
+                    f"packages/{pkg_name}/build.sh and edit "
+                    "termux_step_make_install() before building.",
+                    "warning")
             blank()
 
     subsection("Step 6  --  Additional Dependencies (optional)")
@@ -925,7 +1050,7 @@ def main():
     callout("TIP",
             "Run './termux-build lint <name>' to validate your build.sh before submitting a PR.",
             "tip")
-    if method == "python-script":
+    if method in ("python-script", "shell", "perl", "lua", "php"):
         callout("WARNING",
                 f"Make sure \'{entrypoint}\' actually exists in the repo root. "
                 "If the build fails, the entrypoint may be wrong or the repo uses "
